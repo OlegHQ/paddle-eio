@@ -1,0 +1,16 @@
+(library
+ (name paddle_eio)
+ (public_name paddle-eio)
+ (libraries
+  ca-certs
+  cohttp
+  cohttp-eio
+  digestif
+  domain-name
+  eio
+  tls
+  tls-eio
+  uri
+  yojson)
+ (preprocess
+  (pps ppx_deriving_yojson)))

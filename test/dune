@@ -1,0 +1,3 @@
+(test
+ (name test_paddle_eio)
+ (libraries alcotest eio_main paddle-eio uri yojson))

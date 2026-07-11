@@ -1,0 +1,129 @@
+# paddle-eio
+
+`paddle-eio` is a focused OCaml 5/Eio boundary for the Paddle Billing calls
+Poster needs. It deliberately is not a generated, account-wide SDK.
+
+The library provides:
+
+- sandbox and live API environments;
+- a reusable `Cohttp_eio` HTTPS client with system-CA verification, hostname
+  verification, API version pinning, and a ten-second monotonic timeout;
+- one-call automatic transaction creation from catalog price IDs;
+- temporary customer portal overview sessions;
+- raw-body Paddle webhook verification and generic event-envelope decoding;
+- structured HTTP errors with Paddle's code, detail, request ID, raw body, and
+  `Retry-After` header.
+
+The implementation follows Paddle API version 1. See Paddle's current
+[API quickstart](https://developer.paddle.com/api-reference/about/),
+[transaction API](https://developer.paddle.com/api-reference/transactions/create-transaction/),
+[portal-session API](https://developer.paddle.com/api-reference/customer-portals/create-customer-portal-session/),
+and [webhook verification guide](https://developer.paddle.com/webhooks/about/signature-verification/).
+
+## Installation
+
+Pin a checkout while developing it as a Poster submodule:
+
+```sh
+opam pin add -n paddle-eio ./vendor/paddle-eio
+opam install paddle-eio
+```
+
+The embedding executable must initialize a Mirage Crypto RNG before making TLS
+connections, as required by `tls-eio`. Keep that runtime concern at the
+executable boundary.
+
+## Client lifecycle
+
+Create one client at the application composition root and reuse it for the
+server lifetime:
+
+```ocaml
+let create_paddle env api_key =
+  Paddle_eio.create
+    ~net:(Eio.Stdenv.net env)
+    ~clock:(Eio.Stdenv.mono_clock env)
+    ~environment:Paddle_eio.Sandbox ~api_key ()
+```
+
+Use `Paddle_eio.disabled ()` when billing is intentionally unavailable.
+Operations on a disabled client return `Not_configured`; handlers do not need a
+second placeholder transport.
+
+`Sandbox` uses `https://sandbox-api.paddle.com`; `Live` uses
+`https://api.paddle.com`. API keys are server-side secrets and must come from
+environment or secret storage. Do not expose them to browser code.
+
+## Transactions
+
+```ocaml
+let result =
+  Paddle_eio.create_transaction paddle ~sw
+    ~items:[ { price_id = creator_price_id; quantity = 1 } ]
+    ~customer_id
+    ~checkout_url:"https://poster.example/billing/complete"
+    ~custom_data:(`Assoc [ ("poster_user_id", `String user_id) ])
+    ()
+```
+
+`customer_id` is optional. Omit it for a draft checkout that collects customer
+details. `custom_data`, when supplied, must be a non-empty JSON object.
+
+### Mutation and idempotency caveat
+
+The library sends exactly one request and never automatically retries a Paddle
+mutation. It does not invent or attach an idempotency header. If the connection
+fails after Paddle may have accepted a transaction, the outcome is unknown;
+blindly calling `create_transaction` again can create a duplicate transaction.
+
+Poster should invoke transaction creation inside its durable external-activity
+guard, persist the canonical Paddle transaction ID before completing the
+activity, and treat a started-but-incomplete activity as indeterminate rather
+than repeating the effect. A caller may include its own stable reference in
+`custom_data`, but custom data alone is not an API idempotency guarantee.
+
+## Customer portal
+
+```ocaml
+let result =
+  Paddle_eio.create_customer_portal_session paddle ~sw ~customer_id
+```
+
+Only the temporary overview URL is decoded. Do not persist or cache it, and do
+not embed the Paddle portal in an iframe.
+
+## Webhooks
+
+Read the body once without parsing or reformatting it, then verify the exact raw
+bytes before decoding:
+
+```ocaml
+let verified =
+  Paddle_eio.Webhook.verify ~now:(Int64.of_float (Unix.time ()))
+    ~secret:webhook_secret ~signature_header ~raw_body ()
+```
+
+The default tolerance is five seconds. Verification accepts every `h1` value
+present in `Paddle-Signature`, compares HMAC-SHA256 values in constant time,
+and rejects old or future timestamps outside the tolerance. After verification,
+call `Paddle_eio.Webhook.decode ~raw_body`; its `data` field intentionally stays
+as `Yojson.Safe.t` so the application can route by `event_type` and decode only
+the event types it owns.
+
+## Permissions and production
+
+Use a least-privilege API key with `transaction.write` and
+`customer_portal_session.write`. Develop and test against sandbox. Moving to
+live requires a live Paddle account, separate live catalog IDs and credentials,
+an approved checkout domain/default payment link, and a live notification
+destination with its own endpoint secret.
+
+## Verification
+
+```sh
+dune build @all
+dune runtest
+```
+
+Tests use an injected fake transport to assert complete request shapes without
+network access. Production construction does not expose transport replacement.

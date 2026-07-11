@@ -1,0 +1,32 @@
+opam-version: "2.0"
+synopsis: "Focused Paddle Billing client for OCaml 5 and Eio"
+description: "A small typed Paddle Billing REST and webhook boundary for Eio applications."
+maintainer: "Poster contributors"
+authors: "Poster contributors"
+license: "MIT"
+homepage: "https://github.com/OlegHQ/paddle-eio"
+bug-reports: "https://github.com/OlegHQ/paddle-eio/issues"
+dev-repo: "git+https://github.com/OlegHQ/paddle-eio.git"
+depends: [
+  "ocaml" {>= "5.2"}
+  "dune" {>= "3.12"}
+  "eio" {>= "1.2"}
+  "cohttp" {>= "6.0"}
+  "cohttp-eio" {>= "6.0"}
+  "tls" {>= "1.0"}
+  "tls-eio" {>= "1.0"}
+  "ca-certs" {>= "1.0"}
+  "domain-name"
+  "uri" {>= "4.4"}
+  "yojson" {>= "3.0"}
+  "ppx_deriving_yojson" {>= "3.9"}
+  "digestif" {>= "1.2"}
+  "alcotest" {with-test}
+  "eio_main" {with-test}
+]
+build: [
+  ["dune" "subst"] {dev}
+  ["dune" "build" "-p" name "-j" jobs]
+  ["dune" "runtest" "-p" name "-j" jobs] {with-test}
+]
+
