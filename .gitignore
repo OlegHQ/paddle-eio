@@ -1,3 +1,9 @@
 _build/
 *.install
-
+.direnv/
+.env
+.env.*
+!.env.example
+.vault-token
+*.key
+*.pem

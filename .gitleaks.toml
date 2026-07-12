@@ -1,0 +1,10 @@
+title = "paddle-eio secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "hashicorp-vault-token"
+description = "HashiCorp Vault service, batch, or recovery token"
+regex = '''\bhv[sbr]\.[A-Za-z0-9_-]{20,}\b'''
+keywords = ["hvs.", "hvb.", "hvr."]

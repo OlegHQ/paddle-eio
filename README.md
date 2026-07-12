@@ -203,3 +203,12 @@ dune runtest
 
 Tests use an injected fake transport to assert complete request shapes without
 network access. Production construction does not expose transport replacement.
+
+## Secret safety
+
+Never commit API keys, webhook secrets, Vault tokens, environment files, Dune
+build output, or trace files. Install the repository's Gitleaks pre-commit hook
+or run both history and working-tree scans documented in
+[`SECURITY.md`](SECURITY.md). GitHub secret scanning and push protection remain
+enabled on the public repository; the CI scan adds a focused short-form Vault
+token rule that is not covered by every generic scanner configuration.
