@@ -197,8 +197,8 @@ and a live notification destination with its own endpoint secret.
 ## Verification
 
 ```sh
-dune build @all
-dune runtest
+./scripts/secret-safe-exec.sh opam exec -- dune build --root . @all
+./scripts/secret-safe-exec.sh opam exec -- dune runtest --root .
 ```
 
 Tests use an injected fake transport to assert complete request shapes without

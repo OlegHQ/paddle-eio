@@ -7,6 +7,14 @@ API keys, webhook secrets, Vault tokens, and environment files must never be
 committed. Dune build directories and trace files are ignored because build
 traces may capture process environment values.
 
+Run Dune through the positive environment boundary so credentials exported by
+the parent shell never reach its trace:
+
+```sh
+./scripts/secret-safe-exec.sh opam exec -- dune build --root . @all
+./scripts/secret-safe-exec.sh opam exec -- dune runtest --root .
+```
+
 Before a push, install the configured pre-commit hook:
 
 ```sh
