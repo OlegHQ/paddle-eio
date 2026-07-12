@@ -1,10 +1,51 @@
 type environment = Sandbox | Live
 type price_item = { price_id : string; quantity : int }
+type entity_status = Active | Archived
+type catalog_entity_type = Standard | Custom
+type billing_interval = Day | Week | Month | Year
+type billing_cycle = { interval : billing_interval; frequency : int }
+type unit_price = { amount : string; currency_code : string }
+type quantity = { minimum : int; maximum : int }
+
+type product = {
+  id : string;
+  name : string;
+  entity_type : catalog_entity_type;
+  tax_category : string;
+  status : entity_status;
+}
+
+type price = {
+  id : string;
+  product_id : string;
+  entity_type : catalog_entity_type;
+  billing_cycle : billing_cycle option;
+  trial_period : billing_cycle option;
+  unit_price : unit_price;
+  quantity : quantity;
+  status : entity_status;
+  product : product option;
+}
 
 type transaction = {
   id : string;
   checkout_url : string option;
   customer_id : string option;
+}
+
+type transaction_status =
+  | Draft
+  | Ready
+  | Billed
+  | Paid
+  | Completed
+  | Canceled
+  | Past_due
+
+type transaction_state = {
+  id : string;
+  status : transaction_status;
+  custom_data : Yojson.Safe.t option;
 }
 
 type portal_session = { overview_url : string }
@@ -30,7 +71,7 @@ type error =
   | Decode of decode_error
 
 type request = {
-  meth : [ `POST ];
+  meth : [ `GET | `PATCH | `POST ];
   uri : Uri.t;
   headers : (string * string) list;
   body : string;
@@ -68,6 +109,16 @@ type transaction_json = {
 type transaction_envelope_json = { data : transaction_json }
 [@@deriving yojson { strict = false }]
 
+type transaction_state_json = {
+  id : string;
+  status : string;
+  custom_data : Yojson.Safe.t option; [@default None]
+}
+[@@deriving yojson { strict = false }]
+
+type transaction_state_envelope_json = { data : transaction_state_json }
+[@@deriving yojson { strict = false }]
+
 type portal_general_json = { overview : string }
 [@@deriving yojson { strict = false }]
 
@@ -78,6 +129,40 @@ type portal_session_json = { urls : portal_urls_json }
 [@@deriving yojson { strict = false }]
 
 type portal_envelope_json = { data : portal_session_json }
+[@@deriving yojson { strict = false }]
+
+type cycle_json = { interval : string; frequency : int }
+[@@deriving yojson { strict = false }]
+
+type unit_price_json = { amount : string; currency_code : string }
+[@@deriving yojson { strict = false }]
+
+type quantity_json = { minimum : int; maximum : int }
+[@@deriving yojson { strict = false }]
+
+type product_json = {
+  id : string;
+  name : string;
+  entity_type : string; [@key "type"]
+  tax_category : string;
+  status : string;
+}
+[@@deriving yojson { strict = false }]
+
+type price_json = {
+  id : string;
+  product_id : string;
+  entity_type : string; [@key "type"]
+  billing_cycle : cycle_json option; [@default None]
+  trial_period : cycle_json option; [@default None]
+  unit_price : unit_price_json;
+  quantity : quantity_json;
+  status : string;
+  product : product_json option; [@default None]
+}
+[@@deriving yojson { strict = false }]
+
+type price_envelope_json = { data : price_json }
 [@@deriving yojson { strict = false }]
 
 type error_payload_json = {
@@ -148,9 +233,15 @@ let cohttp_transport ~clock client : transport =
  fun ~sw request ->
   let perform () =
     let headers = Cohttp.Header.of_list request.headers in
-    let body = Cohttp_eio.Body.of_string request.body in
     let http_response, response_body =
-      Cohttp_eio.Client.post client ~sw ~headers ~body request.uri
+      match request.meth with
+      | `GET -> Cohttp_eio.Client.call client ~sw ~headers `GET request.uri
+      | `PATCH ->
+          let body = Cohttp_eio.Body.of_string request.body in
+          Cohttp_eio.Client.call client ~sw ~headers ~body `PATCH request.uri
+      | `POST ->
+          let body = Cohttp_eio.Body.of_string request.body in
+          Cohttp_eio.Client.call client ~sw ~headers ~body `POST request.uri
     in
     let status =
       Cohttp.Response.status http_response |> Cohttp.Code.code_of_status
@@ -190,13 +281,20 @@ let create ~net ~clock ~environment ~api_key () =
       (Configured
          { environment; api_key; transport = cohttp_transport ~clock http })
 
-let headers api_key =
-  [
-    ("Authorization", "Bearer " ^ api_key);
-    ("Paddle-Version", "1");
-    ("Content-Type", "application/json");
-    ("Accept", "application/json");
-  ]
+let headers ?(json = false) api_key =
+  if json then
+    [
+      ("Authorization", "Bearer " ^ api_key);
+      ("Paddle-Version", "1");
+      ("Content-Type", "application/json");
+      ("Accept", "application/json");
+    ]
+  else
+    [
+      ("Authorization", "Bearer " ^ api_key);
+      ("Paddle-Version", "1");
+      ("Accept", "application/json");
+    ]
 
 let header_value name headers =
   let wanted = String.lowercase_ascii name in
@@ -242,16 +340,19 @@ let api_error_of_response response =
       raw_body = response.body;
     }
 
-let post client ~sw ~path ~body ~decode =
+let request client ~sw ~meth ~path ~body ~decode =
   match client with
   | Disabled -> Error Not_configured
   | Configured client -> (
       let request =
         {
-          meth = `POST;
+          meth;
           uri = Uri.of_string (api_base client.environment ^ path);
-          headers = headers client.api_key;
-          body = Yojson.Safe.to_string body;
+          headers =
+            headers
+              ~json:(match meth with `GET -> false | `PATCH | `POST -> true)
+              client.api_key;
+          body;
         }
       in
       match client.transport ~sw request with
@@ -260,6 +361,125 @@ let post client ~sw ~path ~body ~decode =
       | Ok response when response.status >= 200 && response.status < 300 ->
           decode response.body
       | Ok response -> Error (api_error_of_response response))
+
+let get client ~sw ~path ~decode =
+  request client ~sw ~meth:`GET ~path ~body:"" ~decode
+
+let post client ~sw ~path ~body ~decode =
+  request client ~sw ~meth:`POST ~path
+    ~body:(Yojson.Safe.to_string body)
+    ~decode
+
+let patch client ~sw ~path ~body ~decode =
+  request client ~sw ~meth:`PATCH ~path
+    ~body:(Yojson.Safe.to_string body)
+    ~decode
+
+let entity_status ~operation = function
+  | "active" -> Ok Active
+  | "archived" -> Ok Archived
+  | value ->
+      Error
+        (Decode
+           {
+             operation;
+             detail = Printf.sprintf "unknown entity status %S" value;
+           })
+
+let catalog_entity_type ~operation = function
+  | "standard" -> Ok Standard
+  | "custom" -> Ok Custom
+  | value ->
+      Error
+        (Decode
+           {
+             operation;
+             detail = Printf.sprintf "unknown catalog entity type %S" value;
+           })
+
+let billing_interval ~operation = function
+  | "day" -> Ok Day
+  | "week" -> Ok Week
+  | "month" -> Ok Month
+  | "year" -> Ok Year
+  | value ->
+      Error
+        (Decode
+           {
+             operation;
+             detail = Printf.sprintf "unknown billing interval %S" value;
+           })
+
+let billing_cycle ~operation (cycle : cycle_json) =
+  Result.map
+    (fun interval ->
+      ({ interval; frequency = cycle.frequency } : billing_cycle))
+    (billing_interval ~operation cycle.interval)
+
+let optional_cycle ~operation = function
+  | None -> Ok None
+  | Some cycle -> Result.map Option.some (billing_cycle ~operation cycle)
+
+let product_of_json ~operation (product : product_json) =
+  let ( let* ) = Result.bind in
+  let* entity_type = catalog_entity_type ~operation product.entity_type in
+  let* status = entity_status ~operation product.status in
+  Ok
+    ({
+       id = product.id;
+       name = product.name;
+       entity_type;
+       tax_category = product.tax_category;
+       status;
+     }
+      : product)
+
+let price_of_json ~operation (price : price_json) =
+  let ( let* ) = Result.bind in
+  let* entity_type = catalog_entity_type ~operation price.entity_type in
+  let* billing_cycle = optional_cycle ~operation price.billing_cycle in
+  let* trial_period = optional_cycle ~operation price.trial_period in
+  let* status = entity_status ~operation price.status in
+  let* product =
+    match price.product with
+    | None -> Ok None
+    | Some product ->
+        Result.map Option.some (product_of_json ~operation product)
+  in
+  Ok
+    ({
+       id = price.id;
+       product_id = price.product_id;
+       entity_type;
+       billing_cycle;
+       trial_period;
+       unit_price =
+         {
+           amount = price.unit_price.amount;
+           currency_code = price.unit_price.currency_code;
+         };
+       quantity =
+         { minimum = price.quantity.minimum; maximum = price.quantity.maximum };
+       status;
+       product;
+     }
+      : price)
+
+let get_price client ~sw ~price_id ?(include_product = false) () =
+  let ( let* ) = Result.bind in
+  let* () =
+    if String.trim price_id = "" then
+      Error (Invalid_request "price_id must not be empty")
+    else Ok ()
+  in
+  let path = "/prices/" ^ Uri.pct_encode price_id in
+  let path = if include_product then path ^ "?include=product" else path in
+  get client ~sw ~path ~decode:(fun raw_body ->
+      let operation = "get price" in
+      let* envelope =
+        decode_json ~operation price_envelope_json_of_yojson raw_body
+      in
+      price_of_json ~operation envelope.data)
 
 let validate_items items =
   match items with
@@ -338,6 +558,74 @@ let create_transaction client ~sw ~items ?customer_id ?checkout_url ?custom_data
           checkout_url;
           customer_id = envelope.data.customer_id;
         })
+
+let transaction_status ~operation = function
+  | "draft" -> Ok Draft
+  | "ready" -> Ok Ready
+  | "billed" -> Ok Billed
+  | "paid" -> Ok Paid
+  | "completed" -> Ok Completed
+  | "canceled" -> Ok Canceled
+  | "past_due" -> Ok Past_due
+  | value ->
+      Error
+        (Decode
+           {
+             operation;
+             detail = Printf.sprintf "unknown transaction status %S" value;
+           })
+
+let cancel_transaction client ~sw ~transaction_id =
+  let ( let* ) = Result.bind in
+  let operation = "cancel transaction" in
+  let* () = validate_optional "transaction_id" (Some transaction_id) in
+  let path = "/transactions/" ^ Uri.pct_encode transaction_id in
+  patch client ~sw ~path
+    ~body:(`Assoc [ ("status", `String "canceled") ])
+    ~decode:(fun raw_body ->
+      let* envelope =
+        decode_json ~operation transaction_state_envelope_json_of_yojson
+          raw_body
+      in
+      let* status = transaction_status ~operation envelope.data.status in
+      let* () =
+        if String.equal envelope.data.id transaction_id then Ok ()
+        else
+          Error
+            (Decode
+               {
+                 operation;
+                 detail =
+                   Printf.sprintf "response id %S does not match request id %S"
+                     envelope.data.id transaction_id;
+               })
+      in
+      let* () =
+        match status with
+        | Canceled -> Ok ()
+        | _ ->
+            Error
+              (Decode
+                 {
+                   operation;
+                   detail =
+                     Printf.sprintf "response status is %S, expected canceled"
+                       envelope.data.status;
+                 })
+      in
+      let* custom_data =
+        match envelope.data.custom_data with
+        | None -> Ok None
+        | Some (`Assoc _ as value) -> Ok (Some value)
+        | Some _ ->
+            Error
+              (Decode
+                 {
+                   operation;
+                   detail = "response custom_data is not an object or null";
+                 })
+      in
+      Ok ({ id = envelope.data.id; status; custom_data } : transaction_state))
 
 let create_customer_portal_session client ~sw ~customer_id =
   let ( let* ) = Result.bind in
@@ -496,7 +784,7 @@ end
 
 module For_testing = struct
   type nonrec request = request = {
-    meth : [ `POST ];
+    meth : [ `GET | `PATCH | `POST ];
     uri : Uri.t;
     headers : (string * string) list;
     body : string;

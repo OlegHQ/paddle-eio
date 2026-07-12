@@ -8,7 +8,9 @@ The library provides:
 - sandbox and live API environments;
 - a reusable `Cohttp_eio` HTTPS client with system-CA verification, hostname
   verification, API version pinning, and a ten-second monotonic timeout;
+- read-only catalog price lookup with an optional related-product projection;
 - one-call automatic transaction creation from catalog price IDs;
+- explicit transaction cancellation without automatic retries;
 - temporary customer portal overview sessions;
 - raw-body Paddle webhook verification and generic event-envelope decoding;
 - structured HTTP errors with Paddle's code, detail, request ID, raw body, and
@@ -16,7 +18,9 @@ The library provides:
 
 The implementation follows Paddle API version 1. See Paddle's current
 [API quickstart](https://developer.paddle.com/api-reference/about/),
+[get-price API](https://developer.paddle.com/api-reference/prices/get-price/),
 [transaction API](https://developer.paddle.com/api-reference/transactions/create-transaction/),
+[transaction-update API](https://developer.paddle.com/api-reference/transactions/update-transaction/),
 [portal-session API](https://developer.paddle.com/api-reference/customer-portals/create-customer-portal-session/),
 and [webhook verification guide](https://developer.paddle.com/webhooks/about/signature-verification/).
 
@@ -54,6 +58,23 @@ second placeholder transport.
 `https://api.paddle.com`. API keys are server-side secrets and must come from
 environment or secret storage. Do not expose them to browser code.
 
+## Catalog reads
+
+```ocaml
+let result =
+  Paddle_eio.get_price paddle ~sw ~price_id ~include_product:true ()
+```
+
+The decoded projection includes the fields needed for a startup catalog check:
+price/product identity and status, standard/custom type, billing and trial
+cycles, base amount/currency, quantity bounds, and product tax category. It is
+not an entitlement source and callers should not perform provider reads on
+normal application requests.
+
+`get_price` requires `price.read`. Passing `include_product:true` also requires
+`product.read`, as described by Paddle's current
+[permissions documentation](https://developer.paddle.com/api-reference/about/permissions/).
+
 ## Transactions
 
 ```ocaml
@@ -69,18 +90,36 @@ let result =
 `customer_id` is optional. Omit it for a draft checkout that collects customer
 details. `custom_data`, when supplied, must be a non-empty JSON object.
 
+### Cancel a transaction
+
+```ocaml
+let result =
+  Paddle_eio.cancel_transaction paddle ~sw ~transaction_id
+```
+
+Cancellation sends exactly `{"status":"canceled"}` to
+`PATCH /transactions/{transaction_id}` and requires `transaction.write`.
+The returned projection contains only the transaction id, its typed status, and
+its custom data. The client rejects a successful response with a different id,
+a status other than `canceled`, or custom data that is neither an object nor
+`null`.
+
 ### Mutation and idempotency caveat
 
 The library sends exactly one request and never automatically retries a Paddle
 mutation. It does not invent or attach an idempotency header. If the connection
 fails after Paddle may have accepted a transaction, the outcome is unknown;
 blindly calling `create_transaction` again can create a duplicate transaction.
+Similarly, a timeout, transport failure, or undecodable success while canceling
+does not prove that cancellation failed. `cancel_transaction` is not retried;
+the caller must preserve the unknown outcome and reconcile it from trusted
+provider state or a verified webhook before deciding on another mutation.
 
-Poster should invoke transaction creation inside its durable external-activity
-guard, persist the canonical Paddle transaction ID before completing the
-activity, and treat a started-but-incomplete activity as indeterminate rather
-than repeating the effect. A caller may include its own stable reference in
-`custom_data`, but custom data alone is not an API idempotency guarantee.
+An application should persist a durable intent before transaction creation,
+record the canonical Paddle transaction ID after a definite success, and treat
+an ambiguous result as indeterminate rather than repeating the effect. A caller
+may include its own stable reference in `custom_data`, but custom data alone is
+not an API idempotency guarantee.
 
 ## Customer portal
 
@@ -112,11 +151,11 @@ the event types it owns.
 
 ## Permissions and production
 
-Use a least-privilege API key with `transaction.write` and
-`customer_portal_session.write`. Develop and test against sandbox. Moving to
-live requires a live Paddle account, separate live catalog IDs and credentials,
-an approved checkout domain/default payment link, and a live notification
-destination with its own endpoint secret.
+Use a least-privilege API key with `price.read`, `product.read`,
+`transaction.write`, and `customer_portal_session.write`. Develop and test
+against sandbox. Moving to live requires a live Paddle account, separate live
+catalog IDs and credentials, an approved checkout domain/default payment link,
+and a live notification destination with its own endpoint secret.
 
 ## Verification
 

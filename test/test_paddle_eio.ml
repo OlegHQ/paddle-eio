@@ -10,7 +10,15 @@ let standard_headers api_key =
     ("Accept", "application/json");
   ]
 
+let read_headers api_key =
+  [
+    ("Authorization", "Bearer " ^ api_key);
+    ("Paddle-Version", "1");
+    ("Accept", "application/json");
+  ]
+
 let with_switch f = Eio.Switch.run f
+let method_name = function `GET -> "GET" | `PATCH -> "PATCH" | `POST -> "POST"
 
 let transaction_response =
   {|
@@ -59,9 +67,7 @@ let test_create_transaction_exact_request () =
   match !seen with
   | None -> Alcotest.fail "transport was not called"
   | Some request ->
-      Alcotest.(check string)
-        "method" "POST"
-        (match request.meth with `POST -> "POST");
+      Alcotest.(check string) "method" "POST" (method_name request.meth);
       Alcotest.(check string)
         "sandbox URI" "https://sandbox-api.paddle.com/transactions"
         (Uri.to_string request.uri);
@@ -71,6 +77,204 @@ let test_create_transaction_exact_request () =
         "exact JSON body"
         {|{"items":[{"price_id":"pri_creator","quantity":1},{"price_id":"pri_x_addon","quantity":2}],"collection_mode":"automatic","customer_id":"ctm_01test","checkout":{"url":"https://poster.test/billing/complete"},"custom_data":{"poster_user_id":"usr_01test"}}|}
         request.body
+
+let test_get_price_with_product () =
+  let seen = ref None in
+  let api_key = "pdl_live_apikey_test" in
+  let transport ~sw:_ (request : For_testing.request) =
+    seen := Some request;
+    Ok
+      For_testing.
+        {
+          status = 200;
+          headers = [];
+          body =
+            {|{
+              "data": {
+                "id": "pri_creator_monthly",
+                "product_id": "pro_creator",
+                "type": "standard",
+                "billing_cycle": { "interval": "month", "frequency": 1 },
+                "trial_period": null,
+                "unit_price": { "amount": "2400", "currency_code": "USD" },
+                "quantity": { "minimum": 1, "maximum": 100 },
+                "status": "active",
+                "product": {
+                  "id": "pro_creator",
+                  "name": "Poster Creator",
+                  "type": "standard",
+                  "tax_category": "saas",
+                  "status": "active"
+                },
+                "ignored_new_field": true
+              },
+              "meta": { "request_id": "req-price" }
+            }|};
+        }
+  in
+  let client = For_testing.configured ~environment:Live ~api_key transport in
+  let result =
+    with_switch (fun sw ->
+        get_price client ~sw ~price_id:"pri_creator_monthly"
+          ~include_product:true ())
+  in
+  (match result with
+  | Error error -> Alcotest.fail (error_to_string error)
+  | Ok price -> (
+      Alcotest.(check string) "price id" "pri_creator_monthly" price.id;
+      Alcotest.(check string) "product id" "pro_creator" price.product_id;
+      Alcotest.(check bool) "standard price" true (price.entity_type = Standard);
+      Alcotest.(check bool) "active price" true (price.status = Active);
+      Alcotest.(check bool)
+        "monthly" true
+        (price.billing_cycle = Some { interval = Month; frequency = 1 });
+      Alcotest.(check (option string))
+        "no trial" None
+        (Option.map (fun _ -> "trial") price.trial_period);
+      Alcotest.(check string) "amount" "2400" price.unit_price.amount;
+      Alcotest.(check string) "currency" "USD" price.unit_price.currency_code;
+      Alcotest.(check int) "minimum quantity" 1 price.quantity.minimum;
+      Alcotest.(check int) "maximum quantity" 100 price.quantity.maximum;
+      match price.product with
+      | None -> Alcotest.fail "included product was not decoded"
+      | Some product ->
+          Alcotest.(check string) "product name" "Poster Creator" product.name;
+          Alcotest.(check string) "tax category" "saas" product.tax_category;
+          Alcotest.(check bool) "active product" true (product.status = Active)));
+  match !seen with
+  | None -> Alcotest.fail "transport was not called"
+  | Some request ->
+      Alcotest.(check string) "method" "GET" (method_name request.meth);
+      Alcotest.(check string)
+        "live URI"
+        "https://api.paddle.com/prices/pri_creator_monthly?include=product"
+        (Uri.to_string request.uri);
+      Alcotest.(check (list (pair string string)))
+        "headers" (read_headers api_key) request.headers;
+      Alcotest.(check string) "empty GET body" "" request.body
+
+let test_cancel_transaction_exact_request () =
+  let seen = ref None in
+  let api_key = "pdl_sdbx_apikey_test" in
+  let custom_data =
+    `Assoc
+      [
+        ("poster_checkout_intent_id", `String "bci_01test");
+        ("poster_checkout_nonce", `String "nonce_01test");
+      ]
+  in
+  let transport ~sw:_ (request : For_testing.request) =
+    seen := Some request;
+    Ok
+      For_testing.
+        {
+          status = 200;
+          headers = [];
+          body =
+            {|{
+              "data": {
+                "id": "txn_01cancel",
+                "status": "canceled",
+                "custom_data": {
+                  "poster_checkout_intent_id": "bci_01test",
+                  "poster_checkout_nonce": "nonce_01test"
+                },
+                "ignored_new_field": true
+              },
+              "meta": { "request_id": "req-cancel" }
+            }|};
+        }
+  in
+  let client = For_testing.configured ~environment:Sandbox ~api_key transport in
+  let result =
+    with_switch (fun sw ->
+        cancel_transaction client ~sw ~transaction_id:"txn_01cancel")
+  in
+  (match result with
+  | Error error -> Alcotest.fail (error_to_string error)
+  | Ok transaction ->
+      Alcotest.(check string) "transaction id" "txn_01cancel" transaction.id;
+      Alcotest.(check bool)
+        "canceled status" true
+        (transaction.status = Canceled);
+      Alcotest.(check (option json))
+        "custom data" (Some custom_data) transaction.custom_data);
+  match !seen with
+  | None -> Alcotest.fail "transport was not called"
+  | Some request ->
+      Alcotest.(check string) "method" "PATCH" (method_name request.meth);
+      Alcotest.(check string)
+        "sandbox URI" "https://sandbox-api.paddle.com/transactions/txn_01cancel"
+        (Uri.to_string request.uri);
+      Alcotest.(check (list (pair string string)))
+        "headers" (standard_headers api_key) request.headers;
+      Alcotest.(check string)
+        "exact cancel body" {|{"status":"canceled"}|} request.body
+
+let test_cancel_transaction_structured_error_no_retry () =
+  let calls = ref 0 in
+  let raw_body =
+    {|{"error":{"type":"request_error","code":"transaction_invalid_status_change","detail":"This completed transaction cannot be canceled."},"meta":{"request_id":"req-cancel-conflict"}}|}
+  in
+  let transport ~sw:_ (_ : For_testing.request) =
+    incr calls;
+    Ok For_testing.{ status = 409; headers = []; body = raw_body }
+  in
+  let client =
+    For_testing.configured ~environment:Sandbox ~api_key:"sandbox-key" transport
+  in
+  let result =
+    with_switch (fun sw ->
+        cancel_transaction client ~sw ~transaction_id:"txn_completed")
+  in
+  Alcotest.(check int) "single cancel attempt" 1 !calls;
+  match result with
+  | Error
+      (Api
+         {
+           status;
+           code;
+           detail;
+           request_id;
+           retry_after;
+           raw_body = actual_body;
+         }) ->
+      Alcotest.(check int) "status" 409 status;
+      Alcotest.(check (option string))
+        "code" (Some "transaction_invalid_status_change") code;
+      Alcotest.(check (option string))
+        "detail" (Some "This completed transaction cannot be canceled.") detail;
+      Alcotest.(check (option string))
+        "request id" (Some "req-cancel-conflict") request_id;
+      Alcotest.(check (option string)) "retry after" None retry_after;
+      Alcotest.(check string) "raw error body" raw_body actual_body
+  | Error error -> Alcotest.fail (error_to_string error)
+  | Ok _ -> Alcotest.fail "completed transaction unexpectedly canceled"
+
+let test_cancel_transaction_requires_canceled_response () =
+  let transport ~sw:_ (_ : For_testing.request) =
+    Ok
+      For_testing.
+        {
+          status = 200;
+          headers = [];
+          body =
+            {|{"data":{"id":"txn_01stillready","status":"ready","custom_data":null}}|};
+        }
+  in
+  let client =
+    For_testing.configured ~environment:Sandbox ~api_key:"sandbox-key" transport
+  in
+  match
+    with_switch (fun sw ->
+        cancel_transaction client ~sw ~transaction_id:"txn_01stillready")
+  with
+  | Error (Decode { operation = "cancel transaction"; detail }) ->
+      Alcotest.(check string)
+        "status mismatch" {|response status is "ready", expected canceled|}
+        detail
+  | Error error -> Alcotest.fail (error_to_string error)
+  | Ok _ -> Alcotest.fail "non-canceled response was accepted"
 
 let test_create_transaction_without_customer () =
   let seen = ref None in
@@ -302,6 +506,14 @@ let () =
         [
           Alcotest.test_case "transaction request" `Quick
             test_create_transaction_exact_request;
+          Alcotest.test_case "get price with product" `Quick
+            test_get_price_with_product;
+          Alcotest.test_case "cancel transaction request" `Quick
+            test_cancel_transaction_exact_request;
+          Alcotest.test_case "cancel structured error and no retry" `Quick
+            test_cancel_transaction_structured_error_no_retry;
+          Alcotest.test_case "cancel requires canceled response" `Quick
+            test_cancel_transaction_requires_canceled_response;
           Alcotest.test_case "transaction without customer" `Quick
             test_create_transaction_without_customer;
           Alcotest.test_case "portal request" `Quick
