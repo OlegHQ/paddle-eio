@@ -575,6 +575,70 @@ let transaction_status ~operation = function
              detail = Printf.sprintf "unknown transaction status %S" value;
            })
 
+let transaction_state_of_response ~operation ~transaction_id ~allowed_status
+    ~expected_status raw_body =
+  let ( let* ) = Result.bind in
+  let* envelope =
+    decode_json ~operation transaction_state_envelope_json_of_yojson raw_body
+  in
+  let* status = transaction_status ~operation envelope.data.status in
+  let* () =
+    if String.equal envelope.data.id transaction_id then Ok ()
+    else
+      Error
+        (Decode
+           {
+             operation;
+             detail =
+               Printf.sprintf "response id %S does not match request id %S"
+                 envelope.data.id transaction_id;
+           })
+  in
+  let* () =
+    if allowed_status status then Ok ()
+    else
+      Error
+        (Decode
+           {
+             operation;
+             detail =
+               Printf.sprintf "response status is %S, expected %s"
+                 envelope.data.status expected_status;
+           })
+  in
+  let* custom_data =
+    match envelope.data.custom_data with
+    | None -> Ok None
+    | Some (`Assoc _ as value) -> Ok (Some value)
+    | Some _ ->
+        Error
+          (Decode
+             {
+               operation;
+               detail = "response custom_data is not an object or null";
+             })
+  in
+  Ok ({ id = envelope.data.id; status; custom_data } : transaction_state)
+
+let update_transaction_items client ~sw ~transaction_id ~items ~custom_data =
+  let ( let* ) = Result.bind in
+  let operation = "update transaction items" in
+  let* () = validate_optional "transaction_id" (Some transaction_id) in
+  let* () = validate_items items in
+  let* () = validate_custom_data (Some custom_data) in
+  let path = "/transactions/" ^ Uri.pct_encode transaction_id in
+  patch client ~sw ~path
+    ~body:
+      (`Assoc
+         [
+           ("items", `List (List.map item_json items));
+           ("custom_data", custom_data);
+         ])
+    ~decode:
+      (transaction_state_of_response ~operation ~transaction_id
+         ~allowed_status:(function Draft | Ready -> true | _ -> false)
+         ~expected_status:"draft or ready")
+
 let cancel_transaction client ~sw ~transaction_id =
   let ( let* ) = Result.bind in
   let operation = "cancel transaction" in
@@ -582,50 +646,10 @@ let cancel_transaction client ~sw ~transaction_id =
   let path = "/transactions/" ^ Uri.pct_encode transaction_id in
   patch client ~sw ~path
     ~body:(`Assoc [ ("status", `String "canceled") ])
-    ~decode:(fun raw_body ->
-      let* envelope =
-        decode_json ~operation transaction_state_envelope_json_of_yojson
-          raw_body
-      in
-      let* status = transaction_status ~operation envelope.data.status in
-      let* () =
-        if String.equal envelope.data.id transaction_id then Ok ()
-        else
-          Error
-            (Decode
-               {
-                 operation;
-                 detail =
-                   Printf.sprintf "response id %S does not match request id %S"
-                     envelope.data.id transaction_id;
-               })
-      in
-      let* () =
-        match status with
-        | Canceled -> Ok ()
-        | _ ->
-            Error
-              (Decode
-                 {
-                   operation;
-                   detail =
-                     Printf.sprintf "response status is %S, expected canceled"
-                       envelope.data.status;
-                 })
-      in
-      let* custom_data =
-        match envelope.data.custom_data with
-        | None -> Ok None
-        | Some (`Assoc _ as value) -> Ok (Some value)
-        | Some _ ->
-            Error
-              (Decode
-                 {
-                   operation;
-                   detail = "response custom_data is not an object or null";
-                 })
-      in
-      Ok ({ id = envelope.data.id; status; custom_data } : transaction_state))
+    ~decode:
+      (transaction_state_of_response ~operation ~transaction_id
+         ~allowed_status:(fun status -> status = Canceled)
+         ~expected_status:"canceled")
 
 let create_customer_portal_session client ~sw ~customer_id =
   let ( let* ) = Result.bind in

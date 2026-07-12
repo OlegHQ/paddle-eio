@@ -112,13 +112,29 @@ val create_transaction :
 (** Creates one automatically-collected transaction. This function makes one
     HTTP request and never retries the mutation. *)
 
+val update_transaction_items :
+  t ->
+  sw:Eio.Switch.t ->
+  transaction_id:string ->
+  items:price_item list ->
+  custom_data:Yojson.Safe.t ->
+  (transaction_state, error) result
+(** Replaces the complete item list on a draft or ready transaction while
+    writing caller-owned, nonempty custom data. This function makes one HTTP
+    request and never retries the mutation. A successful response is rejected
+    unless its id matches [transaction_id], its status is [Draft] or [Ready],
+    and custom data is an object or null. See
+    {{:https://developer.paddle.com/api-reference/transactions/update-transaction/}
+     Paddle's update-transaction contract}. *)
+
 val cancel_transaction :
   t ->
   sw:Eio.Switch.t ->
   transaction_id:string ->
   (transaction_state, error) result
 (** Cancels a transaction by setting its status to [Canceled]. This function
-    makes one HTTP request and never retries the mutation. A successful response
+    makes one HTTP request and never retries the mutation. Paddle rejects this
+    transition for non-cancelable states such as [Draft]. A successful response
     is rejected unless its id matches [transaction_id], its status is
     [Canceled], and custom data is an object or null. *)
 

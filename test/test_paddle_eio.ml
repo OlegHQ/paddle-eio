@@ -153,6 +153,214 @@ let test_get_price_with_product () =
         "headers" (read_headers api_key) request.headers;
       Alcotest.(check string) "empty GET body" "" request.body
 
+let test_update_transaction_items_exact_request () =
+  let seen = ref None in
+  let api_key = "pdl_sdbx_apikey_test" in
+  let custom_data =
+    `Assoc
+      [
+        ("poster_checkout_intent_id", `String "bci_01test");
+        ("poster_checkout_nonce", `String "nonce_01test");
+      ]
+  in
+  let transport ~sw:_ (request : For_testing.request) =
+    seen := Some request;
+    Ok
+      For_testing.
+        {
+          status = 200;
+          headers = [];
+          body =
+            {|{
+              "data": {
+                "id": "txn_01update",
+                "status": "ready",
+                "custom_data": {
+                  "poster_checkout_intent_id": "bci_01test",
+                  "poster_checkout_nonce": "nonce_01test"
+                },
+                "ignored_new_field": true
+              },
+              "meta": { "request_id": "req-update" }
+            }|};
+        }
+  in
+  let client = For_testing.configured ~environment:Sandbox ~api_key transport in
+  let result =
+    with_switch (fun sw ->
+        update_transaction_items client ~sw ~transaction_id:"txn_01update"
+          ~items:
+            [
+              { price_id = "pri_creator_annual"; quantity = 1 };
+              { price_id = "pri_x_annual"; quantity = 1 };
+            ]
+          ~custom_data)
+  in
+  (match result with
+  | Error error -> Alcotest.fail (error_to_string error)
+  | Ok transaction ->
+      Alcotest.(check string) "transaction id" "txn_01update" transaction.id;
+      Alcotest.(check bool) "ready status" true (transaction.status = Ready);
+      Alcotest.(check (option json))
+        "custom data" (Some custom_data) transaction.custom_data);
+  match !seen with
+  | None -> Alcotest.fail "transport was not called"
+  | Some request ->
+      Alcotest.(check string) "method" "PATCH" (method_name request.meth);
+      Alcotest.(check string)
+        "sandbox URI" "https://sandbox-api.paddle.com/transactions/txn_01update"
+        (Uri.to_string request.uri);
+      Alcotest.(check (list (pair string string)))
+        "headers" (standard_headers api_key) request.headers;
+      Alcotest.(check string)
+        "exact update body"
+        {|{"items":[{"price_id":"pri_creator_annual","quantity":1},{"price_id":"pri_x_annual","quantity":1}],"custom_data":{"poster_checkout_intent_id":"bci_01test","poster_checkout_nonce":"nonce_01test"}}|}
+        request.body
+
+let test_update_transaction_items_structured_error_no_retry () =
+  let calls = ref 0 in
+  let raw_body =
+    {|{"error":{"type":"request_error","code":"transaction_invalid_status_change","detail":"This transaction can no longer be updated."},"meta":{"request_id":"req-update-conflict"}}|}
+  in
+  let transport ~sw:_ (_ : For_testing.request) =
+    incr calls;
+    Ok
+      For_testing.
+        { status = 409; headers = [ ("Retry-After", "15") ]; body = raw_body }
+  in
+  let client =
+    For_testing.configured ~environment:Sandbox ~api_key:"sandbox-key" transport
+  in
+  let result =
+    with_switch (fun sw ->
+        update_transaction_items client ~sw ~transaction_id:"txn_completed"
+          ~items:[ { price_id = "pri_creator"; quantity = 1 } ]
+          ~custom_data:(`Assoc [ ("checkout_intent", `String "bci_01") ]))
+  in
+  Alcotest.(check int) "single update attempt" 1 !calls;
+  match result with
+  | Error
+      (Api
+         {
+           status;
+           code;
+           detail;
+           request_id;
+           retry_after;
+           raw_body = actual_body;
+         }) ->
+      Alcotest.(check int) "status" 409 status;
+      Alcotest.(check (option string))
+        "code" (Some "transaction_invalid_status_change") code;
+      Alcotest.(check (option string))
+        "detail" (Some "This transaction can no longer be updated.") detail;
+      Alcotest.(check (option string))
+        "request id" (Some "req-update-conflict") request_id;
+      Alcotest.(check (option string)) "retry after" (Some "15") retry_after;
+      Alcotest.(check string) "raw error body" raw_body actual_body
+  | Error error -> Alcotest.fail (error_to_string error)
+  | Ok _ -> Alcotest.fail "immutable transaction unexpectedly updated"
+
+let test_update_transaction_items_rejects_wrong_id () =
+  let transport ~sw:_ (_ : For_testing.request) =
+    Ok
+      For_testing.
+        {
+          status = 200;
+          headers = [];
+          body =
+            {|{"data":{"id":"txn_other","status":"draft","custom_data":{"checkout_intent":"bci_01"}}}|};
+        }
+  in
+  let client =
+    For_testing.configured ~environment:Sandbox ~api_key:"sandbox-key" transport
+  in
+  match
+    with_switch (fun sw ->
+        update_transaction_items client ~sw ~transaction_id:"txn_requested"
+          ~items:[ { price_id = "pri_creator"; quantity = 1 } ]
+          ~custom_data:(`Assoc [ ("checkout_intent", `String "bci_01") ]))
+  with
+  | Error (Decode { operation = "update transaction items"; detail }) ->
+      Alcotest.(check string)
+        "id mismatch"
+        {|response id "txn_other" does not match request id "txn_requested"|}
+        detail
+  | Error error -> Alcotest.fail (error_to_string error)
+  | Ok _ -> Alcotest.fail "mismatched transaction id was accepted"
+
+let test_update_transaction_items_accepts_draft () =
+  let transport ~sw:_ (_ : For_testing.request) =
+    Ok
+      For_testing.
+        {
+          status = 200;
+          headers = [];
+          body =
+            {|{"data":{"id":"txn_draft","status":"draft","custom_data":{"checkout_intent":"bci_01"}}}|};
+        }
+  in
+  let client =
+    For_testing.configured ~environment:Sandbox ~api_key:"sandbox-key" transport
+  in
+  match
+    with_switch (fun sw ->
+        update_transaction_items client ~sw ~transaction_id:"txn_draft"
+          ~items:[ { price_id = "pri_creator"; quantity = 1 } ]
+          ~custom_data:(`Assoc [ ("checkout_intent", `String "bci_01") ]))
+  with
+  | Ok transaction ->
+      Alcotest.(check bool) "draft status" true (transaction.status = Draft)
+  | Error error -> Alcotest.fail (error_to_string error)
+
+let test_update_transaction_items_rejects_terminal_status () =
+  let transport ~sw:_ (_ : For_testing.request) =
+    Ok
+      For_testing.
+        {
+          status = 200;
+          headers = [];
+          body =
+            {|{"data":{"id":"txn_completed","status":"completed","custom_data":{"checkout_intent":"bci_01"}}}|};
+        }
+  in
+  let client =
+    For_testing.configured ~environment:Sandbox ~api_key:"sandbox-key" transport
+  in
+  match
+    with_switch (fun sw ->
+        update_transaction_items client ~sw ~transaction_id:"txn_completed"
+          ~items:[ { price_id = "pri_creator"; quantity = 1 } ]
+          ~custom_data:(`Assoc [ ("checkout_intent", `String "bci_01") ]))
+  with
+  | Error (Decode { operation = "update transaction items"; detail }) ->
+      Alcotest.(check string)
+        "status mismatch"
+        {|response status is "completed", expected draft or ready|} detail
+  | Error error -> Alcotest.fail (error_to_string error)
+  | Ok _ -> Alcotest.fail "terminal transaction status was accepted"
+
+let test_update_transaction_items_requires_custom_data () =
+  let calls = ref 0 in
+  let transport ~sw:_ (_ : For_testing.request) =
+    incr calls;
+    Alcotest.fail "invalid update reached transport"
+  in
+  let client =
+    For_testing.configured ~environment:Sandbox ~api_key:"sandbox-key" transport
+  in
+  let result =
+    with_switch (fun sw ->
+        update_transaction_items client ~sw ~transaction_id:"txn_draft"
+          ~items:[ { price_id = "pri_creator"; quantity = 1 } ]
+          ~custom_data:(`Assoc []))
+  in
+  Alcotest.(check int) "no HTTP request" 0 !calls;
+  match result with
+  | Error (Invalid_request "custom_data must contain at least one key") -> ()
+  | Error error -> Alcotest.fail (error_to_string error)
+  | Ok _ -> Alcotest.fail "empty custom data was accepted"
+
 let test_cancel_transaction_exact_request () =
   let seen = ref None in
   let api_key = "pdl_sdbx_apikey_test" in
@@ -508,6 +716,18 @@ let () =
             test_create_transaction_exact_request;
           Alcotest.test_case "get price with product" `Quick
             test_get_price_with_product;
+          Alcotest.test_case "update transaction items request" `Quick
+            test_update_transaction_items_exact_request;
+          Alcotest.test_case "update structured error and no retry" `Quick
+            test_update_transaction_items_structured_error_no_retry;
+          Alcotest.test_case "update rejects wrong id" `Quick
+            test_update_transaction_items_rejects_wrong_id;
+          Alcotest.test_case "update accepts draft" `Quick
+            test_update_transaction_items_accepts_draft;
+          Alcotest.test_case "update rejects terminal status" `Quick
+            test_update_transaction_items_rejects_terminal_status;
+          Alcotest.test_case "update requires custom data" `Quick
+            test_update_transaction_items_requires_custom_data;
           Alcotest.test_case "cancel transaction request" `Quick
             test_cancel_transaction_exact_request;
           Alcotest.test_case "cancel structured error and no retry" `Quick

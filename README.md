@@ -10,6 +10,7 @@ The library provides:
   verification, API version pinning, and a ten-second monotonic timeout;
 - read-only catalog price lookup with an optional related-product projection;
 - one-call automatic transaction creation from catalog price IDs;
+- complete item-list replacement for mutable transactions;
 - explicit transaction cancellation without automatic retries;
 - temporary customer portal overview sessions;
 - raw-body Paddle webhook verification and generic event-envelope decoding;
@@ -90,6 +91,37 @@ let result =
 `customer_id` is optional. Omit it for a draft checkout that collects customer
 details. `custom_data`, when supplied, must be a non-empty JSON object.
 
+### Replace transaction items
+
+```ocaml
+let result =
+  Paddle_eio.update_transaction_items paddle ~sw ~transaction_id
+    ~items:
+      [
+        { price_id = creator_annual_price_id; quantity = 1 };
+        { price_id = x_annual_price_id; quantity = 1 };
+      ]
+    ~custom_data:
+      (`Assoc
+        [
+          ("checkout_intent_id", `String checkout_intent_id);
+          ("checkout_nonce", `String checkout_nonce);
+        ])
+```
+
+Paddle's
+[update-transaction API](https://developer.paddle.com/api-reference/transactions/update-transaction/)
+treats `items` as a complete replacement list: omitted existing items are
+removed. Only `draft` and `ready` transactions are mutable, and the call
+requires `transaction.write`. `custom_data` is mandatory in this focused API
+and must be a non-empty object supplied by the server-side caller; do not copy
+ownership data from browser input.
+
+The call sends exactly one `PATCH /transactions/{transaction_id}` request and
+does not retry. It returns the transaction id, typed status, and custom data,
+and rejects a nominally successful response when the id differs, the status is
+not `draft` or `ready`, or custom data is neither an object nor `null`.
+
 ### Cancel a transaction
 
 ```ocaml
@@ -99,6 +131,10 @@ let result =
 
 Cancellation sends exactly `{"status":"canceled"}` to
 `PATCH /transactions/{transaction_id}` and requires `transaction.write`.
+Paddle permits cancellation only for a transaction state it considers
+cancelable (currently `ready` or `billed`); in particular, use
+`update_transaction_items` rather than trying to cancel a draft to change its
+selection.
 The returned projection contains only the transaction id, its typed status, and
 its custom data. The client rejects a successful response with a different id,
 a status other than `canceled`, or custom data that is neither an object nor
@@ -111,7 +147,8 @@ mutation. It does not invent or attach an idempotency header. If the connection
 fails after Paddle may have accepted a transaction, the outcome is unknown;
 blindly calling `create_transaction` again can create a duplicate transaction.
 Similarly, a timeout, transport failure, or undecodable success while canceling
-does not prove that cancellation failed. `cancel_transaction` is not retried;
+does not prove that cancellation failed. The same ambiguity applies to an item
+update. `update_transaction_items` and `cancel_transaction` are not retried;
 the caller must preserve the unknown outcome and reconcile it from trusted
 provider state or a verified webhook before deciding on another mutation.
 
